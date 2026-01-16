@@ -47,19 +47,25 @@ def send_alert_worker(frame, confidence, description, target_url):
         ret, buffer = cv2.imencode('.jpg', frame)
         if not ret: return
 
-        # Prepare Data
+        # ✅ FIX: Generate a UNIQUE filename
+        timestamp = int(time.time())
+        unique_filename = f"scream_alert_{timestamp}.jpg"
+
+        # Prepare Data Payload
         data_payload = {
             'beacon_id': BEACON_ID,
             'confidence_score': f"{confidence:.2f}",
             'description': description,
             'device_id': DEVICE_ID
         }
+        
+        # Prepare File Payload
         files_payload = {
-            'images': ('audio_screenshot.jpg', buffer.tobytes(), 'image/jpeg')
+            'images': (unique_filename, buffer.tobytes(), 'image/jpeg')
         }
 
         # Send Request
-        print(f"📤 Uploading to {target_url}...")
+        print(f"📤 Uploading {unique_filename} to {target_url}...")
         response = requests.post(target_url, data=data_payload, files=files_payload, timeout=10)
         
         if response.status_code in [200, 201]:
@@ -114,12 +120,13 @@ with st.sidebar:
     
     # 2. Camera Switcher
     st.subheader("📷 Camera Source")
+    # Added index 2 just in case
     camera_option = st.selectbox(
         "Select Camera",
-        options=[0, 1, 2, 3],
-        format_func=lambda x: f"Camera Index {x} {'(Default)' if x==0 else ''}"
+        options=[0, 1, 2], 
+        format_func=lambda x: f"Camera Index {x}"
     )
-    st.info("If the video is black or fails, try a different index.")
+    st.info("Try Index 0 or 1. If 'Frame Dropped', try restarting the app.")
 
 col1, col2 = st.columns([1, 2])
 with col1:
@@ -148,15 +155,21 @@ if run_detection:
     
     photos_taken_session = 0
     
-    # ✅ Initialize Camera with SELECTED Index
-    cap = cv2.VideoCapture(camera_option)
+    # ✅ FIX: Force DirectShow (cv2.CAP_DSHOW) for Windows
+    # This usually fixes the "Camera frame dropped" error
+    cap = cv2.VideoCapture(camera_option, cv2.CAP_DSHOW)
     
-    # If standard open fails, try DSHOW (for Windows) if index is not 0
-    if not cap.isOpened() and camera_option > 0:
-        cap = cv2.VideoCapture(camera_option, cv2.CAP_DSHOW)
+    # If DSHOW fails to open, fallback to default
+    if not cap.isOpened():
+        print(f"DirectShow failed for Index {camera_option}, trying default...")
+        cap = cv2.VideoCapture(camera_option)
 
     if not cap.isOpened():
-        st.error(f"❌ Could not open Camera {camera_option}. Try a different index.")
+        st.error(f"❌ Could not open Camera {camera_option}. Check if another app is using it.")
+    else:
+        # Camera Warmup: Read one frame to initialize auto-exposure
+        cap.read()
+        time.sleep(0.5)
     
     try:
         with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE) as stream:
@@ -169,10 +182,12 @@ if run_detection:
                 # 2. Camera
                 ret, frame = cap.read()
                 if ret and frame is not None:
+                    # Convert BGR to RGB for Streamlit
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     camera_placeholder.image(frame_rgb, channels="RGB", width='stretch')
                 else:
-                    st.warning("⚠️ Camera frame dropped")
+                    # This warning will show if the driver is busy or failing
+                    st.warning(f"⚠️ Camera frame dropped (Index {camera_option})")
 
                 # 3. AI Logic
                 yamnet_score = 0.0
@@ -182,6 +197,7 @@ if run_detection:
                 
                 vol_metric.metric("Volume", f"{vol:.4f}")
 
+                # Silence Filter
                 if vol > 0.003:
                     yamnet_score = yamnet_scream_confidence(audio_chunk)
                     speech_score, detected_text = speech_keyword_confidence(audio_chunk)
@@ -193,12 +209,12 @@ if run_detection:
                     if final_score > 0.5:
                         alert_area.error(f"🚨 ALARM! Conf: {final_score:.2f}")
                         
-                        # Only take 1 photo per scream event
+                        # Only 1 Photo per Scream Event
                         if ret and frame is not None and photos_taken_session < 1:
                             
                             desc_text = f"Scream detected. Keyword: {detected_text if detected_text else 'None'}"
                             
-                            # Send to background thread
+                            # Use frame.copy() + unique filename
                             t = threading.Thread(
                                 target=send_alert_worker, 
                                 args=(frame.copy(), final_score, desc_text, api_url)
