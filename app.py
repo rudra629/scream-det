@@ -1,235 +1,233 @@
 import streamlit as st
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase, AudioProcessorBase
+import av
 import numpy as np
-import sounddevice as sd
 import tensorflow as tf
 import tensorflow_hub as hub
-import speech_recognition as sr
-import io
-import soundfile as sf
+import threading
+import queue
 import time
 import cv2
 import requests
-import threading
+import os
+import json
+
+# --- VOSK IMPORT (Safe Fallback) ---
+try:
+    from vosk import Model, KaldiRecognizer
+    VOSK_AVAILABLE = True
+except ImportError:
+    VOSK_AVAILABLE = False
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Campus Safety Beacon", page_icon="🚨", layout="wide")
 
 # --- CONFIGURATION ---
-SAMPLE_RATE = 16000
-CHUNK_DURATION = 3 
-BLOCK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
-
-# Beacon Config
 BEACON_ID = "ab907856-3412-3412-3412-341278563412"
-DEVICE_ID = "AI-AUDIO-MONITORING-02"
+DEVICE_ID = "AI-AUDIO-MONITORING-CLOUD"
+BACKEND_URL = "https://resq-server.onrender.com/api/scream-detected/"
+
+# STUN Servers (Required for Cloud Connectivity to connect browser to server)
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 # --- LOAD MODELS ---
 @st.cache_resource
-def load_yamnet_model():
-    return hub.load("https://tfhub.dev/google/yamnet/1")
+def load_models():
+    # 1. Load YAMNet
+    yamnet = hub.load("https://tfhub.dev/google/yamnet/1")
+    
+    # 2. Load Vosk (Speech Recognition)
+    vosk_model = None
+    if VOSK_AVAILABLE and os.path.exists("model"):
+        try:
+            vosk_model = Model("model")
+            print("✅ Vosk Model Loaded")
+        except Exception as e:
+            print(f"❌ Vosk Error: {e}")
+    return yamnet, vosk_model
 
 try:
     with st.spinner("Loading AI Models..."):
-        YAMNET_MODEL = load_yamnet_model()
+        YAMNET_MODEL, VOSK_MODEL = load_models()
 except Exception as e:
-    st.error(f"Error loading model: {e}")
+    st.error(f"Error loading models: {e}")
 
-SPEECH_KEYWORDS = ["help", "save me", "stop", "please", "danger", "bachao"]
+# --- SHARED STATE ---
+lock = threading.Lock()
+shared_state = {
+    "latest_frame": None,
+    "photos_taken_session": 0,
+    "audio_buffer": queue.Queue(),
+}
 
-# --- API FUNCTION ---
-def send_alert_worker(frame, confidence, description, target_url):
-    """Sends the alert to the specified target_url in a background thread."""
-    if frame is None or frame.size == 0:
-        return
+if "data_queue" not in st.session_state:
+    st.session_state.data_queue = queue.Queue()
 
+# --- BACKGROUND AI WORKER ---
+def ai_worker():
+    print("🚀 AI Worker Started")
+    rec = None
+    if VOSK_MODEL:
+        rec = KaldiRecognizer(VOSK_MODEL, 16000, '["help", "save me", "stop", "danger", "bachao", "scream"]')
+
+    yamnet_buffer = np.array([], dtype=np.float32)
+
+    while True:
+        try:
+            chunk_bytes, chunk_float = shared_state["audio_buffer"].get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        # 1. SPEECH RECOGNITION
+        detected_text = None
+        if rec:
+            if rec.AcceptWaveform(chunk_bytes):
+                result = json.loads(rec.Result())
+                if result['text']:
+                    detected_text = result['text']
+
+        # 2. SCREAM DETECTION
+        yamnet_buffer = np.append(yamnet_buffer, chunk_float)
+        
+        if len(yamnet_buffer) >= 16000:
+            analysis_chunk = yamnet_buffer[:16000]
+            yamnet_buffer = yamnet_buffer[16000:] 
+
+            vol = np.sqrt(np.mean(analysis_chunk ** 2))
+            scream_score = 0.0
+            
+            if vol > 0.005:
+                try:
+                    scores, _, _ = YAMNET_MODEL(analysis_chunk)
+                    scream_score = float(np.max(scores.numpy()))
+                except: pass
+
+            # 3. DECISION LOGIC
+            final_score = (0.4 * scream_score)
+            if detected_text: 
+                final_score = 0.9 
+
+            alert = False
+            if final_score > 0.5:
+                alert = True
+                with lock:
+                    if shared_state["latest_frame"] is not None and shared_state["photos_taken_session"] < 1:
+                        t = threading.Thread(
+                            target=send_alert_worker, 
+                            args=(shared_state["latest_frame"].copy(), final_score, f"Alert: {detected_text if detected_text else 'Scream'}")
+                        )
+                        t.start()
+                        shared_state["photos_taken_session"] = 1
+            else:
+                if vol < 0.002: 
+                    with lock: shared_state["photos_taken_session"] = 0
+
+            # Update UI
+            try:
+                st.session_state.data_queue.put_nowait({
+                    "vol": vol,
+                    "score": final_score,
+                    "text": detected_text,
+                    "alert": alert
+                })
+            except: pass
+
+# --- UPLOAD WORKER ---
+def send_alert_worker(frame, confidence, description):
     try:
-        # Encode image to JPG
         ret, buffer = cv2.imencode('.jpg', frame)
         if not ret: return
 
-        # Prepare Data
-        data_payload = {
+        timestamp = int(time.time())
+        unique_filename = f"cloud_alert_{timestamp}.jpg"
+
+        data = {
             'beacon_id': BEACON_ID,
             'confidence_score': f"{confidence:.2f}",
             'description': description,
             'device_id': DEVICE_ID
         }
-        files_payload = {
-            'images': ('audio_screenshot.jpg', buffer.tobytes(), 'image/jpeg')
-        }
+        files = {'images': (unique_filename, buffer.tobytes(), 'image/jpeg')}
 
-        # Send Request
-        print(f"📤 Uploading to {target_url}...")
-        response = requests.post(target_url, data=data_payload, files=files_payload, timeout=10)
-        
-        if response.status_code in [200, 201]:
-            print(f"✅ Upload Success: {response.status_code}")
-        else:
-            print(f"❌ Upload Failed: {response.status_code} | {response.text}")
-
+        requests.post(BACKEND_URL, data=data, files=files, timeout=10)
     except Exception as e:
-        print(f"❌ Connection Error: {e}")
+        print(f"Upload Error: {e}")
 
-# --- PROCESSING FUNCTIONS ---
-def yamnet_scream_confidence(audio):
-    try:
-        audio_tensor = tf.convert_to_tensor(audio, dtype=tf.float32)
-        scores, _, _ = YAMNET_MODEL(audio_tensor)
-        return float(np.max(scores.numpy())) 
-    except:
-        return 0.0
+# --- WEBRTC PROCESSORS ---
+class VideoProcessor(VideoProcessorBase):
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        with lock:
+            shared_state["latest_frame"] = img.copy()
+        return frame
 
-def speech_keyword_confidence(audio):
-    recognizer = sr.Recognizer()
-    buffer = io.BytesIO()
-    sf.write(buffer, audio, SAMPLE_RATE, format="WAV", subtype='PCM_16')
-    buffer.seek(0)
-    try:
-        with sr.AudioFile(buffer) as source:
-            audio_data = recognizer.record(source)
-        try:
-            text = recognizer.recognize_google(audio_data, show_all=False).lower()
-        except:
-            return 0.0, None
-        conf = 0.8 if any(k in text for k in SPEECH_KEYWORDS) else 0.0
-        return conf, text
-    except:
-        return 0.0, None
+class AudioProcessor(AudioProcessorBase):
+    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+        sound_data = frame.to_ndarray()
+        
+        if sound_data.ndim > 1:
+            sound_data_mono = np.mean(sound_data, axis=1)
+        else:
+            sound_data_mono = sound_data
+            
+        if sound_data_mono.dtype != np.float32:
+            sound_data_float = sound_data_mono.astype(np.float32) / 32768.0
+        else:
+            sound_data_float = sound_data_mono
+
+        sound_data_float = sound_data_float[::3]
+        sound_data_int16 = (sound_data_float * 32767).astype(np.int16)
+        sound_bytes = sound_data_int16.tobytes()
+
+        shared_state["audio_buffer"].put((sound_bytes, sound_data_float))
+        return frame
 
 # --- UI LAYOUT ---
-st.title("🚨 AI Campus Safety Beacon")
-st.markdown("---")
+st.title("🚨 Campus Safety (Cloud Edition)")
+st.caption("Status: AI Running in Background Thread")
 
-# --- SIDEBAR SETTINGS ---
-with st.sidebar:
-    st.header("⚙️ Settings")
-    
-    # 1. API URL Config
-    api_url = st.text_input(
-        "Backend API URL", 
-        value="https://resq-server.onrender.com/api/scream-detected/"
-    )
-    
-    st.divider()
-    
-    # 2. Camera Switcher
-    st.subheader("📷 Camera Source")
-    camera_option = st.selectbox(
-        "Select Camera",
-        options=[0, 1, 2, 3],
-        format_func=lambda x: f"Camera Index {x} {'(Default)' if x==0 else ''}"
-    )
-    st.info("If the video is black or fails, try a different index.")
+if "ai_thread_started" not in st.session_state:
+    t = threading.Thread(target=ai_worker, daemon=True)
+    t.start()
+    st.session_state.ai_thread_started = True
 
-col1, col2 = st.columns([1, 2])
+col1, col2 = st.columns([1.5, 1])
+
 with col1:
-    st.subheader("Controls")
-    run_detection = st.checkbox("Start Monitoring", value=False)
-    st.divider()
-    st.subheader("Live Feed")
-    camera_placeholder = st.empty() 
-    status_indicator = st.empty()
+    st.subheader("Sensor Stream")
+    ctx = webrtc_streamer(
+        key="safety-beacon",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": True, "audio": True},
+        video_processor_factory=VideoProcessor,
+        audio_processor_factory=AudioProcessor,
+        async_processing=True,
+    )
 
 with col2:
-    st.subheader("Live Analysis")
-    m1, m2, m3 = st.columns(3)
-    vol_metric = m1.empty()
-    yamnet_metric = m2.empty()
-    speech_metric = m3.empty()
-    st.markdown("### 🔍 Detected Keywords")
-    log_area = st.empty()
-    st.markdown("### ⚠️ Alert Status")
-    alert_area = st.empty()
+    st.subheader("Telemetry")
+    vol_metric = st.empty()
+    score_metric = st.empty()
+    text_metric = st.empty()
+    alert_box = st.empty()
 
-# --- MAIN LOOP ---
-if run_detection:
-    status_indicator.markdown("🟢 **System Active**")
-    if 'logs' not in st.session_state: st.session_state['logs'] = []
-    
-    photos_taken_session = 0
-    
-    # ✅ Initialize Camera with SELECTED Index
-    cap = cv2.VideoCapture(camera_option)
-    
-    # If standard open fails, try DSHOW (for Windows) if index is not 0
-    if not cap.isOpened() and camera_option > 0:
-        cap = cv2.VideoCapture(camera_option, cv2.CAP_DSHOW)
-
-    if not cap.isOpened():
-        st.error(f"❌ Could not open Camera {camera_option}. Try a different index.")
-    
-    try:
-        with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE) as stream:
-            while run_detection:
-                # 1. Audio
-                indata, overflowed = stream.read(BLOCK_SIZE)
-                audio_chunk = indata.flatten()
-                vol = np.sqrt(np.mean(audio_chunk ** 2))
+    if ctx.state.playing:
+        while True:
+            try:
+                data = st.session_state.data_queue.get(timeout=0.1)
                 
-                # 2. Camera
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    camera_placeholder.image(frame_rgb, channels="RGB", width='stretch')
-                else:
-                    st.warning("⚠️ Camera frame dropped")
-
-                # 3. AI Logic
-                yamnet_score = 0.0
-                speech_score = 0.0
-                detected_text = None
-                final_score = 0.0
+                vol_metric.metric("Volume", f"{data['vol']:.4f}")
+                score_metric.metric("Confidence", f"{data['score']:.2f}")
                 
-                vol_metric.metric("Volume", f"{vol:.4f}")
-
-                if vol > 0.003:
-                    yamnet_score = yamnet_scream_confidence(audio_chunk)
-                    speech_score, detected_text = speech_keyword_confidence(audio_chunk)
-                    
-                    final_score = (0.4 * yamnet_score) + (0.6 * speech_score)
-                    if speech_score > 0: final_score = 0.9
-
-                    # --- ALERT TRIGGER ---
-                    if final_score > 0.5:
-                        alert_area.error(f"🚨 ALARM! Conf: {final_score:.2f}")
-                        
-                        # Only take 1 photo per scream event
-                        if ret and frame is not None and photos_taken_session < 1:
-                            
-                            desc_text = f"Scream detected. Keyword: {detected_text if detected_text else 'None'}"
-                            
-                            # Send to background thread
-                            t = threading.Thread(
-                                target=send_alert_worker, 
-                                args=(frame.copy(), final_score, desc_text, api_url)
-                            )
-                            t.start()
-                            
-                            st.toast(f"📸 Evidence Photo Uploaded!")
-                            
-                            photos_taken_session = 1 
-
-                        if detected_text:
-                            st.session_state['logs'].insert(0, f"🗣️ '{detected_text}'")
-                            st.session_state['logs'] = st.session_state['logs'][:5]
-                            log_area.code("\n".join(st.session_state['logs']))     
-                    else:
-                        alert_area.success("✅ Safe")
-                        if vol < 0.002: photos_taken_session = 0
-
-                    yamnet_metric.metric("Scream Score", f"{yamnet_score:.2f}")
-                    speech_metric.metric("Speech Score", f"{speech_score:.2f}")
+                if data['text']:
+                    text_metric.info(f"🗣️ Heard: {data['text']}")
+                
+                if data['alert']:
+                    alert_box.error("🚨 SCREAM DETECTED!")
                 else:
-                    photos_taken_session = 0
-                    alert_area.success("✅ Safe")
-                    yamnet_metric.metric("Scream Score", "0.00")
-                    speech_metric.metric("Speech Score", "0.00")
-
+                    alert_box.success("Monitoring...")
+            except queue.Empty:
                 time.sleep(0.01)
-
-    except Exception as e:
-        st.error(f"Error: {e}")
-    finally:
-        cap.release() 
-else:
-    status_indicator.markdown("🔴 **Stopped**")
