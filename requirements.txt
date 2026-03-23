@@ -9,3 +9,4 @@ requests
 av
 vosk
 setuptools
+# sa
